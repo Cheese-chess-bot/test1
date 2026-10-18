@@ -202,7 +202,7 @@ def test_timeout_becomes_an_api_error(monkeypatch):
     def timeout(*a, **k):
         raise requests.exceptions.ReadTimeout("read timed out")
 
-    monkeypatch.setattr(requests, "request", timeout)
+    monkeypatch.setattr(requests.Session, "request", timeout)
     with pytest.raises(AlpacaAPIError) as e:
         client.get_account()
     assert e.value.status_code == 0 and "network error" in str(e.value)

@@ -24,7 +24,7 @@ def answers(monkeypatch):
 
 
 def test_openrouter_wire_contract(monkeypatch, answers):
-    def post(url, **kwargs):
+    def post(self, url, **kwargs):
         assert url == "https://openrouter.ai/api/alpha/decisions"
         assert kwargs["headers"]["Authorization"] == "Bearer test-key"
         assert kwargs["json"] == {
@@ -33,7 +33,7 @@ def test_openrouter_wire_contract(monkeypatch, answers):
         }
         assert kwargs["allow_redirects"] is False
         return Response(data={"answers": answers, "model": "typesafe/jev-1.14-test", "usage": {}})
-    monkeypatch.setattr(client.requests, "post", post)
+    monkeypatch.setattr(client.requests.Session, "post", post)
     result, meta = run_battery(client.OpenRouterDecisionClient("test-key"), {"mid": 100}, 5)
     assert result == answers
     assert meta["route"] == "OpenRouter"
@@ -42,7 +42,7 @@ def test_openrouter_wire_contract(monkeypatch, answers):
 
 @pytest.mark.parametrize("status", [401, 402, 403, 404, 429, 500, 302])
 def test_api_failure_never_echoes_response(monkeypatch, status):
-    monkeypatch.setattr(client.requests, "post", lambda *a, **k: Response(status, text="secret-key"))
+    monkeypatch.setattr(client.requests.Session, "post", lambda *a, **k: Response(status, text="secret-key"))
     with pytest.raises(client.DecisionClientError) as error:
         client.OpenRouterDecisionClient("secret-key").ask({}, {}, 5)
     assert "secret-key" not in str(error.value)
@@ -53,14 +53,14 @@ def test_api_failure_never_echoes_response(monkeypatch, status):
 def test_timeout_is_handled(monkeypatch):
     def fail(*a, **k):
         raise requests.Timeout("secret-key")
-    monkeypatch.setattr(client.requests, "post", fail)
+    monkeypatch.setattr(client.requests.Session, "post", fail)
     with pytest.raises(client.DecisionClientError, match="deadline"):
         client.OpenRouterDecisionClient("test-key").ask({}, {}, 5)
 
 
 @pytest.mark.parametrize("bad", [None, {}, {"answers": []}, {"error": "denied"}])
 def test_bad_envelope_rejected(monkeypatch, bad):
-    monkeypatch.setattr(client.requests, "post", lambda *a, **k: Response(data=bad))
+    monkeypatch.setattr(client.requests.Session, "post", lambda *a, **k: Response(data=bad))
     with pytest.raises(client.DecisionClientError):
         run_battery(client.OpenRouterDecisionClient("test-key"), {}, 5)
 
@@ -69,7 +69,7 @@ def test_bad_envelope_rejected(monkeypatch, bad):
 def test_bad_probability_rejected(monkeypatch, answers, value):
     changed = copy.deepcopy(answers)
     changed["toxic_flow"]["noul"] = value
-    monkeypatch.setattr(client.requests, "post", lambda *a, **k: Response(data={"answers": changed}))
+    monkeypatch.setattr(client.requests.Session, "post", lambda *a, **k: Response(data={"answers": changed}))
     with pytest.raises(client.DecisionClientError, match="invalid battery"):
         run_battery(client.OpenRouterDecisionClient("test-key"), {}, 5)
 
