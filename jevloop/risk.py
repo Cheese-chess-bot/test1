@@ -8,6 +8,7 @@ whether it's really that bad".
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .limits import Limits
@@ -38,6 +39,13 @@ def check(
     kill limits still apply; the order-size and inventory-age vetoes do
     not, because blocking the exit is what froze the loop with a stuck
     position in the first published version."""
+    values = [snapshot.get(k) for k in (
+        "drawdown_pct", "inventory", "mid", "daily_loss_usd", "position_age_s", "data_age_s")]
+    values += [snapshot.get("leverage", 1.0), order_notional_usd]
+    if decision_latency_ms is not None:
+        values.append(decision_latency_ms)
+    if any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in values) or snapshot["mid"] <= 0:
+        return RiskVerdict(False, "invalid or missing risk data")
     # 1. max drawdown
     if snapshot["drawdown_pct"] > limits.max_drawdown_pct:
         return RiskVerdict(False, "max_drawdown breached", kill=True)

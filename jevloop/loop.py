@@ -43,11 +43,10 @@ from pathlib import Path
 
 from . import control
 from .assets import AssetSpec, UnknownSymbolError, resolve_symbol, size_order
-from .battery import run_battery
+from .decisions import BackgroundDecisions
+from .live_guard import LiveGuard
 from .client import (
-    DecisionClientError,
     JevThrottle,
-    RateLimited,
     resolve_decision_client,
 )
 from .execution.alpaca import (
@@ -60,6 +59,7 @@ from .execution.alpaca import (
 )
 from .ladder import Rung, select_rung
 from .limits import Limits
+from .risk import check as risk_check
 from .policy import (
     KILL,
     PULL_QUOTES,
@@ -254,6 +254,9 @@ def run(
     bar_seconds: float | None = None,
 ) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if live and bar_seconds:
+        print("cannot start live: bar mode would delay risk checks; use the regular tick loop")
+        return 1
 
     try:
         spec = resolve_symbol(symbol)
@@ -275,6 +278,11 @@ def run(
     # One shared client for the whole run, and one throttle in front of it.
     client = resolve_decision_client(mock=mock)
     throttle = JevThrottle()
+    throttle.max_age_s = min(throttle.max_age_s, limits.max_judgment_age_s)
+    decisions = BackgroundDecisions(client, throttle, limits.max_decision_latency_ms / 1000)
+    live_guard = None
+    live_guard_reason = None
+    last_account_check = -math.inf
     print(
         f"jev calls: at most one every {throttle.min_interval_s:g}s (sooner on a material "
         f"change, never under {throttle.min_gap_s:g}s), last judgment reused in between"
@@ -292,7 +300,7 @@ def run(
     # Bar mode: sleep to each bar close, then run one block. Otherwise one
     # block every limits.tick_seconds. Jev's deadline stays short either way.
     cadence_s = 0.0 if bar_seconds else limits.tick_seconds
-    deadline_s = min(bar_seconds, BAR_DECISION_DEADLINE_S) if bar_seconds else limits.tick_seconds
+    deadline_s = limits.max_decision_latency_ms / 1000
     if bar_seconds:
         print(
             f"tick cadence: one decision at each {bar_seconds / 60:g}-minute bar close "
@@ -303,6 +311,7 @@ def run(
             f"tick cadence: one block every {limits.tick_seconds:.1f}s "
             f"(Alpaca calls capped at {limits.max_alpaca_calls_per_minute}/min)"
         )
+    print(f"Jev runs in the background with its own {deadline_s:g}s timeout; max judgment age {throttle.max_age_s:g}s")
     print(
         "your strategy lives in strategy.py (edit thresholds, or the apply_strategy hook)"
     )
@@ -325,10 +334,25 @@ def run(
     # money. If the account cannot be read (dry run without a working key),
     # fall back to the position cap, the most this loop can ever put at risk.
     try:
-        start_equity = float(alpaca.get_account().get("equity") or 0.0)
-    except AlpacaAPIError as exc:
+        account = alpaca.get_account()
+        start_equity = float(account.get("equity") or 0.0)
+        if live:
+            if client.name == "MOCK":
+                raise ValueError("Live mode requires a real OpenRouter Jev client")
+            if abs(alpaca.get_position_qty()) > 1e-10 or alpaca.get_orders(status="open"):
+                raise ValueError("Live startup requires this symbol flat and no open account orders")
+            live_guard = LiveGuard(LOG_DIR, account, limits)
+    except (AlpacaAPIError, ValueError, OSError, KeyError, TypeError) as exc:
+        if live:
+            print(f"cannot start live: {exc}")
+            decisions.close()
+            if live_guard:
+                live_guard.close()
+            if hasattr(alpaca, "close"):
+                alpaca.close()
+            return 1
         start_equity = 0.0
-        print(f"could not read account equity ({exc.status_code}); ", end="")
+        print(f"could not read account equity ({exc}); ", end="")
     if start_equity <= 0:
         start_equity = limits.max_position_usd
         print(f"drawdown measured against the ${start_equity:.2f} position cap")
@@ -338,7 +362,7 @@ def run(
     # Whatever the account already held in this symbol before the run is
     # not the loop's: fees are measured against it, and it is never sold.
     start_held = 0.0
-    if not dry_execution:
+    if not dry_execution and not live:
         try:
             start_held = alpaca.get_position_qty()
         except AlpacaAPIError:
@@ -359,6 +383,14 @@ def run(
         print(f"price history: {len(price_hist)} one-minute bars backfilled")
     except (AlpacaAPIError, KeyError, ValueError) as exc:
         print(f"price history: no backfill ({exc}); returns fill in as ticks arrive")
+    except BaseException:
+        # Startup interrupts/errors must release the live lock too.
+        decisions.close()
+        if hasattr(alpaca, "close"):
+            alpaca.close()
+        if live_guard:
+            live_guard.close()
+        raise
     trade_tape: list[tuple[float, float, float, str]] = []  # (ts, price, size, side)
     seen_trade_ids: set = set()
     trades_since_iso = _iso(session_start - TRADE_TAPE_S)
@@ -384,6 +416,7 @@ def run(
             tick_start = time.monotonic()
             block += 1
             now = time.time()
+            market_started = time.monotonic()
 
             # Market-hours guard for equities: never even ask Jev about a
             # frozen market, and never place an order while it is closed.
@@ -393,6 +426,9 @@ def run(
                 except AlpacaAPIError as exc:
                     api_error_streak += 1
                     print(f"tick {block} | alpaca error checking market hours: {exc}")
+                    if live or api_error_streak > limits.max_api_errors:
+                        print("Broker error limit reached; stopping and cancelling own orders.")
+                        break
                     _sleep_remaining(tick_start, cadence_s)
                     n += 1
                     continue
@@ -429,9 +465,23 @@ def run(
             except AlpacaAPIError as exc:
                 api_error_streak += 1
                 print(f"tick {block} | alpaca error: {exc}")
+                if live or api_error_streak > limits.max_api_errors:
+                    print("Broker error limit reached; stopping and cancelling own orders. Check any open position in Alpaca.")
+                    break
                 _sleep_remaining(tick_start, cadence_s)
                 n += 1
                 continue
+
+            market_ms = (time.monotonic() - market_started) * 1000
+            now = time.time()
+            state_started = time.monotonic()
+            if live_guard and time.monotonic() - last_account_check >= 10:
+                try:
+                    live_guard_reason = live_guard.check(alpaca.get_account())
+                    last_account_check = time.monotonic()
+                except (AlpacaAPIError, ValueError, OSError) as exc:
+                    print(f"Live account safety check failed; stopping: {exc}")
+                    break
 
             # Real trades only, each with the venue's own timestamp, each
             # counted once (deduplicated on the trade id).
@@ -467,7 +517,7 @@ def run(
                 else 0.0
             )
 
-            data_ts = now
+            data_ts = getattr(alpaca, "market_data_timestamp", None) or (0.0 if live else now)
             if bar_seconds:
                 try:
                     price_hist = _minute_bar_history(alpaca, now)
@@ -523,44 +573,22 @@ def run(
             equity_now = inv.equity_usd + inv.realised_pnl_usd + snapshot["unrealised_pnl_usd"]
             inv.high_water_mark_usd = max(inv.high_water_mark_usd, equity_now)
 
-            # 4. battery, throttled. The fast loop never waits on Jev: Jev is
-            # called only when the throttle says so, and every other tick
-            # reuses the last judgment (see "Jev call rate" in README.md).
-            elapsed = time.monotonic() - tick_start
-            budget = max(0.05, deadline_s - elapsed - 0.15)
-            decision_late = False
-            answers = None
-            meta = {"model": None, "latency_ms": None, "route": None}
-            clock = time.monotonic()
-            call_reason = throttle.due(snapshot, clock)
-            jev_down = False
-            if call_reason is not None:
-                throttle.called(clock)
-                try:
-                    answers, meta = run_battery(client, snapshot, timeout=budget)
-                    throttle.success(answers, meta, snapshot, clock)
-                except RateLimited as exc:
-                    wait = throttle.rate_limited(clock)
-                    print(
-                        f"tick {block} | Jev rate limit ({exc}), backing off {wait:.0f}s, "
-                        f"reusing the last judgment meanwhile"
-                    )
-                except DecisionClientError as exc:
-                    msg = str(exc)
-                    if "deadline" in msg:
-                        decision_late = True
-                    else:
-                        jev_down = True
-                        print(f"tick {block} | decision client error: {exc}")
-            if answers is None and not jev_down:
-                cached = throttle.last(clock)
-                if cached is not None:
-                    answers, meta = cached
-                    decision_late = False
-                elif not decision_late:
-                    jev_down = True  # no judgment young enough to reuse: RULES_ONLY
+            # 4. Jev has its own worker. Market/risk ticks do not await its HTTP request.
+            state_ms = (time.monotonic() - state_started) * 1000
+            decision_poll_started = time.monotonic()
+            answers, meta = decisions.poll(snapshot)
+            if bar_seconds:
+                # Explicit bar-close mode waits only its independent bounded request budget.
+                decisions.wait_for_current()
+                answers, meta = decisions.poll(snapshot, launch=False)
+            decision_poll_ms = (time.monotonic() - decision_poll_started) * 1000
+            decision_status = meta.get("status", "waiting for Jev")
+            jev_down = answers is None and decision_status in ("unavailable", "rate limited")
+            decision_late = answers is None and (live or not jev_down)
+            # Age must include broker/reconciliation time and any explicit bar wait.
+            snapshot["data_age_s"] = max(0.0, time.time() - data_ts)
+            execution_started = time.monotonic()
 
-            # 5. policy engine (code) + 6. pricing (code)
             if decision_late:
                 action = None
             elif jev_down or answers is None:
@@ -587,7 +615,11 @@ def run(
             execution_health_score = (
                 answers["execution_health"]["score"] if answers else None
             )
-            risk_kill_pre = snapshot["drawdown_pct"] > limits.max_drawdown_pct
+            preflight = risk_check(snapshot, 0.0, limits, api_error_streak, None, closing=True)
+            risk_kill_pre = preflight.kill or bool(live_guard_reason) or (
+                live and snapshot["inventory"] != 0
+                and snapshot["position_age_s"] > limits.max_inventory_age_s
+            )
             rung = select_rung(
                 risk_kill=risk_kill_pre,
                 decision_late=decision_late,
@@ -604,11 +636,19 @@ def run(
             fill_txt = "-"
             kill = False
             seq_before = getattr(alpaca, "_order_seq", 0)
-            if rung == Rung.HOLD_LATE or action is None:
-                line_action = "HOLD (late)"
-            elif rung == Rung.KILL or (action and action.kind == KILL):
+            if rung == Rung.KILL or (action and action.kind == KILL):
                 line_action = "KILL (flatten)"
                 kill = True
+            elif rung == Rung.HOLD_LATE or action is None or not preflight.ok:
+                reason = preflight.veto if not preflight.ok else decision_status
+                line_action = f"HOLD ({reason})"
+                if not dry_execution and (resting_quotes or (live and getattr(alpaca, "_order_seq", 0))):
+                    try:
+                        alpaca.cancel_own_orders()
+                        resting_quotes = None
+                        reconcile_needed = True
+                    except AlpacaAPIError:
+                        api_error_streak += 1
             else:
                 # 7. risk veto happens inside execute_action via risk.check
                 (
@@ -653,7 +693,8 @@ def run(
             elif recon_txt:
                 fill_txt = recon_txt if fill_txt == "-" else f"{fill_txt}; {recon_txt}"
 
-            # 9. log
+            execution_ms = (time.monotonic() - execution_started) * 1000
+            # 9. log: wall-clock stages expose broker/network/model bottlenecks.
             record = {
                 "tick": block,
                 "ts": now,
@@ -685,7 +726,14 @@ def run(
                     answers["execution_health"]["score"] if answers else None
                 ),
                 "action": action.kind if action else "HOLD_LATE",
-                "action_reason": action.reason if action else "block deadline exceeded",
+                "action_reason": action.reason if action else decision_status,
+                "decision_status": decision_status,
+                "decision_pending": meta.get("pending", False),
+                "mode": "irl" if live else "paper",
+                "timing_ms": {"market": round(market_ms, 1), "state": round(state_ms, 1),
+                              "decision_poll": round(decision_poll_ms, 1),
+                              "execution": round(execution_ms, 1),
+                              "tick": round((time.monotonic() - tick_start) * 1000, 1)},
                 "direction_leg": action.direction_leg if action else None,
                 "skew": action.skew if action else 0.0,
                 "rung": rung.value,
@@ -724,11 +772,12 @@ def run(
             xh_txt = f"{answers['execution_health']['score']:.1f}" if answers else "n/a"
             ms_txt = (
                 f"reused {meta.get('age_s', 0):.0f}s" if meta.get("reused")
-                else f"{meta.get('latency_ms'):.0f} ms" if meta.get("latency_ms") else "late"
+                else f"{meta.get('latency_ms'):.0f} ms" if meta.get("latency_ms") else decision_status
             )
             print(
                 f"tick {block} | mid {_fmt_money(mid)} | regime {regime_txt} | "
-                f"tox {tox_txt} | env {env_txt} | xh {xh_txt} | {ms_txt} | {line_action} | {fill_txt}"
+                f"tox {tox_txt} | env {env_txt} | xh {xh_txt} | {ms_txt} | {line_action} | {fill_txt} "
+                f"| market {market_ms:.0f}ms / tick {record['timing_ms']['tick']:.0f}ms"
             )
 
             if rung == Rung.KILL:
@@ -761,8 +810,21 @@ def run(
                 )
         else:
             print(f"tick {block} | shut down cleanly, no resting orders to cancel.")
+        decisions.close()
+        if hasattr(alpaca, "close"):
+            alpaca.close()
+        if live_guard:
+            live_guard.close()
         if previous_sigterm_handler is not None:
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+
+def _market_timestamp(value):
+    try:
+        ts = _parse_ts(value)
+        return ts if math.isfinite(ts) and ts <= time.time() + 1 else None
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _read_top_of_book(
@@ -774,11 +836,13 @@ def _read_top_of_book(
     lists, never fabricated levels, when nothing is available."""
     if spec.has_depth:
         book = alpaca.get_orderbook()
+        alpaca.market_data_timestamp = _market_timestamp(book.get("t"))
         bids = [(float(l["p"]), float(l["s"])) for l in book.get("b", [])]
         asks = [(float(l["p"]), float(l["s"])) for l in book.get("a", [])]
         return bids, asks
 
     quote = alpaca.get_latest_quote()
+    alpaca.market_data_timestamp = _market_timestamp(quote.get("t"))
     bids = (
         [(float(quote["bp"]), float(quote.get("bs", 0.0)))] if quote.get("bp") else []
     )
@@ -957,6 +1021,9 @@ def _execute_action(
                         held_usd = max(alpaca.get_position_qty(), inv.inventory, 0.0) * mid
                         buy_room_usd = limits.max_position_usd - held_usd
                     sides = [("sell", sell_qty, ask_px)]
+                    if getattr(alpaca, "is_live", False):
+                        sell_qty = _floor_qty(min(sell_qty, max(inv.inventory, 0.0), max(alpaca.get_position_qty(), 0.0)), spec)
+                        sides = [("sell", sell_qty, ask_px)] if sell_qty > 0 else []
                     if buy_qty * bid_px <= buy_room_usd:
                         sides.insert(0, ("buy", buy_qty, bid_px))
                         buy_room_usd -= buy_qty * bid_px
@@ -1032,12 +1099,16 @@ def _execute_action(
             else:
                 try:
                     inv.orders_submitted += 1
-                    o = alpaca.submit_market_order(side, leg_qty)
+                    if getattr(alpaca, "is_live", False) and side == "buy":
+                        # Live entries have a price ceiling; never an unbounded market buy.
+                        o = alpaca.submit_limit_order(side, leg_qty, fill_px, tif="ioc")
+                    else:
+                        o = alpaca.submit_market_order(side, leg_qty)
                     if expected_px is not None and o.get("client_order_id"):
                         expected_px[o["client_order_id"]] = mid
                     # Not recorded as filled here: inventory and PnL only move
                     # when Alpaca reports the fill (reconcile_fills, next tick).
-                    fill_txt = f"sent market {side} {leg_qty}"
+                    fill_txt = f"sent {'IOC limit' if getattr(alpaca, 'is_live', False) and side == 'buy' else 'market'} {side} {leg_qty}"
                     line_action = f"{action.kind} skew {action.skew:+.1f} + {side} leg"
                 except MarketClosedError as exc:
                     fill_txt = f"leg skipped: {exc}"

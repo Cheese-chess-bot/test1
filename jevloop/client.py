@@ -46,14 +46,14 @@ def _is_rate_limit(status: int, text: str) -> bool:
     return status == 429 or "frequency" in t or "rate limit" in t or "too many requests" in t
 
 
-def _post_with_retry(url: str, headers: dict, body: dict, timeout: float) -> dict:
+def _post_with_retry(url: str, headers: dict, body: dict, timeout: float, session=None) -> dict:
     deadline = time.monotonic() + timeout
     for attempt in range(MAX_RETRIES + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DecisionClientError("block deadline exceeded")
         try:
-            resp = requests.post(
+            resp = (session or requests).post(
                 url, headers=headers, json=body, timeout=remaining,
                 allow_redirects=False,
             )
@@ -101,6 +101,10 @@ class OpenRouterDecisionClient(BaseDecisionClient):
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         super().__init__(name="OpenRouter", model=model)
         self._api_key = api_key
+        self._session = requests.Session()
+
+    def close(self):
+        self._session.close()
 
     def ask(self, state: dict, questions: dict, timeout: float) -> tuple[dict, dict]:
         t0 = time.monotonic()
@@ -110,7 +114,7 @@ class OpenRouterDecisionClient(BaseDecisionClient):
             "Content-Type": "application/json",
         }
         with _CALL_LOCK:
-            data = _post_with_retry(OPENROUTER_URL, headers, body, timeout)
+            data = _post_with_retry(OPENROUTER_URL, headers, body, timeout, self._session)
         answers = data.get("answers")
         if not isinstance(answers, dict):
             raise DecisionClientError("OpenRouter response is missing typed answers")
@@ -303,7 +307,10 @@ class JevThrottle:
         self.min_interval_s = min_interval_s if min_interval_s is not None else float(env("JEV_MIN_INTERVAL_S") or 4.0)
         self.min_gap_s = min_gap_s if min_gap_s is not None else float(env("JEV_MIN_GAP_S") or 3.0)
         self.move_bps = move_bps if move_bps is not None else float(env("JEV_MATERIAL_MOVE_BPS") or 15.0)
-        self.max_age_s = max_age_s if max_age_s is not None else float(env("JEV_MAX_JUDGMENT_AGE_S") or 60.0)
+        self.max_age_s = max_age_s if max_age_s is not None else float(env("JEV_MAX_JUDGMENT_AGE_S") or 10.0)
+        for value in (self.min_interval_s, self.min_gap_s, self.move_bps, self.max_age_s):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Jev throttle settings must be positive finite numbers")
         self.backoff_base_s = backoff_base_s
         self.backoff_max_s = backoff_max_s
         self.answers: dict | None = None
@@ -324,7 +331,7 @@ class JevThrottle:
         if abs((snap.get("spread_bps") or 0.0) - (ref.get("spread_bps") or 0.0)) >= self.move_bps:
             return "spread moved"
         inv, ref_inv = snap.get("inventory") or 0.0, ref.get("inventory") or 0.0
-        if (inv > 0) != (ref_inv > 0) or (inv < 0) != (ref_inv < 0):
+        if not math.isclose(inv, ref_inv, rel_tol=0.01, abs_tol=1e-10):
             return "position changed"
         return None
 

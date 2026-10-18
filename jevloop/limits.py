@@ -28,9 +28,11 @@ class Limits:
     max_stale_data_age_s: float = 5.0  # market data older than this is refused
     max_api_errors: int = 5  # consecutive broker/API errors before kill
     max_decision_latency_ms: float = (
-        2000.0  # Jev slower than this on a block = late, hold
+        8000.0  # independent Jev request budget; stale snapshot checks also apply
     )
     max_leverage: float = 1.0  # spot/cash only, no leverage, ever
+
+    max_judgment_age_s: float = 10.0  # age from source snapshot, not response arrival
 
     # The seven policy thresholds compose_action() used to read from here
     # (toxic flow, liquidity stress, quote environment, inventory pressure,
