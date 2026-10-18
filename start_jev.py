@@ -1,4 +1,4 @@
-"""Prompt locally for credentials, verify them, and launch Jev on Alpaca paper."""
+"""Run Jev via OpenRouter: test (30 paper ticks), full (paper), or irl (live)."""
 from __future__ import annotations
 
 import argparse
@@ -25,26 +25,30 @@ def secret(prompt: str) -> str:
             print("A value is required. Ctrl+C cancels.")
 
 
-def collect_credentials(use_env: bool = False) -> dict[str, str]:
+def collect_credentials(use_env: bool = False, live: bool = False) -> dict[str, str]:
+    label = "LIVE" if live else "PAPER"
     prompts = {
         "OPENROUTER_API_KEY": "OpenRouter API key (hidden): ",
-        "ALPACA_API_KEY": "Alpaca PAPER API key ID (hidden): ",
-        "ALPACA_SECRET_KEY": "Alpaca PAPER secret key (hidden): ",
+        "ALPACA_API_KEY": f"Alpaca {label} API key ID (hidden): ",
+        "ALPACA_SECRET_KEY": f"Alpaca {label} secret key (hidden): ",
     }
-    return {
-        name: ((os.environ.get(name) or "").strip() if use_env else "") or secret(prompt)
-        for name, prompt in prompts.items()
-    }
+    result = {}
+    for name, prompt in prompts.items():
+        env_name = name.replace("ALPACA_", "ALPACA_LIVE_") if live and name.startswith("ALPACA_") else name
+        result[name] = ((os.environ.get(env_name) or "").strip() if use_env else "") or secret(prompt)
+    return result
 
 
-def verify_connections(credentials: dict[str, str], model: str) -> None:
+def verify_connections(credentials: dict[str, str], model: str, live: bool = False) -> None:
     import requests
     from jevloop.battery import run_battery
     from jevloop.client import OpenRouterDecisionClient
 
+    label = "LIVE" if live else "paper"
+    base = "https://api.alpaca.markets" if live else "https://paper-api.alpaca.markets"
     try:
         response = requests.get(
-            "https://paper-api.alpaca.markets/v2/account",
+            f"{base}/v2/account",
             headers={
                 "APCA-API-KEY-ID": credentials["ALPACA_API_KEY"],
                 "APCA-API-SECRET-KEY": credentials["ALPACA_SECRET_KEY"],
@@ -53,20 +57,20 @@ def verify_connections(credentials: dict[str, str], model: str) -> None:
             allow_redirects=False,
         )
     except requests.RequestException:
-        raise RuntimeError("Could not reach Alpaca paper. Check your connection and retry.") from None
+        raise RuntimeError(f"Could not reach Alpaca {label}. Check your connection and retry.") from None
     if response.status_code != 200:
         raise RuntimeError(
-            f"Alpaca paper HTTP {response.status_code}. Check your PAPER key ID and secret."
+            f"Alpaca {label} HTTP {response.status_code}. Check your {label} key ID and secret."
         )
     try:
         account = response.json()
     except ValueError:
         raise RuntimeError("Alpaca returned invalid JSON.") from None
     if not isinstance(account, dict) or account.get("status") != "ACTIVE":
-        raise RuntimeError("The Alpaca paper account is not ACTIVE.")
+        raise RuntimeError(f"The Alpaca {label} account is not ACTIVE.")
     if account.get("trading_blocked") or account.get("account_blocked"):
-        raise RuntimeError("Trading is blocked on this Alpaca paper account.")
-    print("Alpaca paper connection verified.")
+        raise RuntimeError(f"Trading is blocked on this Alpaca {label} account.")
+    print(f"Alpaca {label} connection verified.")
     # Synthetic state validates all seven answer schemas without placing orders.
     state = {
         "purpose": "connection test; synthetic data; no order will be submitted",
@@ -74,10 +78,11 @@ def verify_connections(credentials: dict[str, str], model: str) -> None:
         "inventory": 0.0, "fill_ratio": 1.0, "reject_count": 0,
         "last_10_latencies_ms": [100.0], "last_10_slippage_bps": [0.0],
     }
-    _, meta = run_battery(
-        OpenRouterDecisionClient(credentials["OPENROUTER_API_KEY"], model),
-        state, timeout=20,
-    )
+    client = OpenRouterDecisionClient(credentials["OPENROUTER_API_KEY"], model)
+    try:
+        _, meta = run_battery(client, state, timeout=20)
+    finally:
+        client.close()
     print(f"OpenRouter Jev verified: {meta['model']}.")
 
 
@@ -90,9 +95,10 @@ def nonnegative_int(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["test", "full", "irl"], help="Prompted when omitted")
     parser.add_argument("--symbol", help="Alpaca symbol, e.g. BTC/USD or AAPL")
-    parser.add_argument("--ticks", type=nonnegative_int, default=30,
-                        help="Number of ticks; default 30, 0 runs until Ctrl+C")
+    parser.add_argument("--ticks", type=nonnegative_int, default=None,
+                        help="Optional tick bound for full/irl; test is always 30 ticks, 0 is continuous")
     parser.add_argument("--bar", choices=["1m", "5m", "15m", "30m", "1h"])
     parser.add_argument("--model", default=os.environ.get("OPENROUTER_JEV_MODEL") or "typesafe/jev-1.14")
     parser.add_argument("--use-env", action="store_true",
@@ -110,26 +116,42 @@ def main(argv: list[str] | None = None) -> int:
 
     previous: dict[str, str | None] = {}
     try:
-        print("Jev via OpenRouter | Alpaca PAPER only")
+        mode = args.mode
+        while mode not in ("test", "full", "irl"):
+            mode = input("Mode [test/full/irl] (default test): ").strip().lower() or "test"
+            if mode not in ("test", "full", "irl"):
+                print("Choose test, full, or irl.")
+        if mode == "test" and args.ticks not in (None, 30):
+            raise ValueError("test mode is exactly 30 ticks; use full with --ticks for another count")
+        live = mode == "irl"
+        if live and args.bar:
+            raise ValueError("irl requires regular ticks so risk checks keep running; omit --bar")
+        ticks = args.ticks if args.ticks is not None else (30 if mode == "test" else 0)
+        if live and os.environ.get("JEV_LOOP_ALLOW_LIVE") != "i-understand-the-risk":
+            raise ValueError("irl needs explicit opt-in: set JEV_LOOP_ALLOW_LIVE=i-understand-the-risk, then run again")
+        print(f"Jev via OpenRouter | mode={mode} | Alpaca {'LIVE REAL MONEY' if live else 'PAPER'}")
+        if live:
+            print("Live limits: $25/order, $50 position, $25 UTC-day loss, 5% drawdown, 15-minute holding limit.")
+            print("Fresh market data and Jev judgments required. Use a dedicated account; no other bots or manual orders.")
         print("Keys are hidden and kept in this process only; no credentials are saved.")
         print("Verification sends one billed Jev request; a running loop makes further billed calls.")
         symbol = args.symbol or input("Symbol [BTC/USD]: ").strip() or "BTC/USD"
         symbol = resolve_symbol(symbol).symbol
-        credentials = collect_credentials(args.use_env)
-        verify_connections(credentials, args.model)
+        credentials = collect_credentials(args.use_env, live)
+        verify_connections(credentials, args.model, live)
         if args.check_only:
             print("Checks passed. No orders submitted.")
             return 0
         settings = dict(credentials, OPENROUTER_JEV_MODEL=args.model,
-                        ALPACA_BASE_URL="https://paper-api.alpaca.markets")
+                        ALPACA_BASE_URL="https://api.alpaca.markets" if live else "https://paper-api.alpaca.markets")
         previous = {name: os.environ.get(name) for name in settings}
         os.environ.update(settings)
-        command = ["--paper", "--symbol", symbol, "--ticks", str(args.ticks)]
+        command = ["--live" if live else "--paper", "--symbol", symbol, "--ticks", str(ticks)]
         if args.bar:
             command += ["--bar", args.bar]
         if args.dry_execution:
             command += ["--dry-execution"]
-        print("Starting paper loop. Ctrl+C stops the loop; existing positions may remain open.")
+        print(f"Starting {mode} loop. Ctrl+C stops the loop; existing positions may remain open.")
         return loop.main(command)
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")

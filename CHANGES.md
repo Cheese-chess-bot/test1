@@ -1,3 +1,18 @@
+# Modes and responsiveness
+
+- Added prompted/CLI test (30 paper ticks), full (continuous paper), and irl
+  (guarded live) modes, with separate live environment credentials.
+- Moved Jev to a single background worker; reused HTTP sessions; added stage
+  timings and explicit pending/stale status. Exact default model remains
+  typesafe/jev-1.14 through OpenRouter Decisions API.
+- Count judgment age from its source request; invalidate on material market or
+  inventory changes. Keep risk checks active while Jev is pending.
+- Added persistent UTC-day live loss stops and a local account lock, startup
+  account checks, cash/long-only order guards, live IOC limit entries, and
+  fresh venue-data checks. Live never uses the paper rules-only fallback.
+- Added offline concurrency, mode-routing and live-boundary regression tests.
+  No authenticated API call or order was made during this update.
+
 # OpenRouter adaptation
 
 - Extracted the runnable project from the supplied Pasted text(3).txt scaffold.

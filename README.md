@@ -17,33 +17,34 @@ python -m pip install -e ".[dev]"
 python start_jev.py
 ```
 
-On Windows, `py` can be used instead of `python`. The launcher prompts for:
+On Windows, `py` can be used instead of `python`. The launcher asks for mode,
+symbol, OpenRouter API key, and the selected Alpaca account's key ID and secret.
+Keys are hidden in your terminal and never saved. It verifies the account and
+makes one billed Jev connection-test call before starting.
 
-1. Symbol (default BTC/USD).
-2. OpenRouter API key (hidden).
-3. Alpaca **paper** API key ID (hidden).
-4. Alpaca **paper** secret key (hidden).
-
-It checks the paper account and makes one billed Jev connection-test call,
-then runs 30 paper ticks. It saves no credentials. Enter keys only in your
-local terminal. A terminal that cannot hide input is refused. Ctrl+C cancels.
-No Vercel account or direct TypeSafe API key is used.
+| Mode | Account | Duration |
+| --- | --- | --- |
+| `test` (default) | Paper | Exactly 30 ticks |
+| `full` | Paper | Continuous until Ctrl+C |
+| `irl` | Live, real money | Continuous, with explicit opt-in and live checks below |
 
 ```bash
-python start_jev.py --check-only            # checks only; no orders
-python start_jev.py --dry-execution         # market data and Jev; no orders
-python start_jev.py --symbol AAPL --ticks 30
-python start_jev.py --symbol BTC/USD --ticks 0  # continuous; Ctrl+C stops
-python start_jev.py --bar 30m --ticks 10
-python -m jevloop serve                    # second terminal; localhost:8765
-python -m pytest -q                       # offline tests
+python start_jev.py --mode test
+python start_jev.py --mode full
+python start_jev.py --mode test --check-only       # verification; no orders
+python start_jev.py --mode test --dry-execution    # real data/Jev; no orders
+python start_jev.py --mode full --ticks 100        # optional bound on full/irl
+python start_jev.py --mode full --bar 30m --ticks 10  # paper only
+python -m jevloop serve                            # second terminal; localhost:8765
+python -m pytest -q                               # offline tests
 ```
 
-`--use-env` reuses existing environment credentials and prompts for missing
-ones. The launcher does not load or write `.env`. The `.env.example` is for
-advanced users loading configuration themselves. The launcher never accepts
-`--live` and pins Alpaca to its paper endpoint, even if the environment says
-otherwise. The original lower-level CLI retains its existing three live gates.
+`--use-env` reuses environment credentials and prompts for missing ones. Paper
+uses `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`; irl uses `ALPACA_LIVE_API_KEY` and
+`ALPACA_LIVE_SECRET_KEY`. Both use `OPENROUTER_API_KEY`. Live never silently
+reuses paper keys. The launcher does not load or write `.env`; `.env.example`
+is for users loading configuration themselves. No Vercel account or direct
+TypeSafe API key is used. The server is optional and starts only when requested.
 
 OpenRouter requests use `https://openrouter.ai/api/alpha/decisions`, with
 `model`, `state`, and `questions`. The default model is `typesafe/jev-1.14`;
@@ -98,7 +99,7 @@ paper: a mock run is always a dry run.
 
 ## Running continuously
 
-Use `python start_jev.py --ticks 0` in a terminal. Keep that process running.
+Use `python start_jev.py --mode full` in a terminal. Keep that process running.
 Add `--bar 30m` (or `1m`, `5m`, `15m`, `1h`) for decisions on UTC bar closes.
 Ctrl+C stops the foreground loop and attempts to cancel its own resting orders.
 It does not automatically flatten positions. A forced process kill can skip
@@ -122,56 +123,82 @@ block event -> read the book -> state snapshot -> battery (seven Jev judgments)
   -> log, fills, inventory
 ```
 
-## Jev call rate
+## Responsiveness and Jev call rate
 
-The existing throttle is retained; tune it for your OpenRouter limits and budget.
+Jev runs in one background worker with an independent 8-second HTTP timeout
+budget. The ordinary 2-second tick no longer waits for the response. Alpaca and
+OpenRouter reuse HTTP connections. Broker calls still run on the tick thread:
+network delays and the shared 90-call/minute limiter can extend a tick. This is
+not a WebSocket feed or a latency guarantee. Explicit paper bar mode waits for
+a result at the bar close; live mode refuses bar scheduling so risk checks are
+not postponed for minutes.
 
-- The fast loop runs every tick on price and risk, and reuses the last
-  Jev judgment between calls.
-- Jev is called at most once every `JEV_MIN_INTERVAL_S` seconds (default
-  4, so 15 a minute), or sooner when the state changes materially: price
-  or spread moves `JEV_MATERIAL_MOVE_BPS` (default 15 bps) or the
-  position flips. Even then never more often than `JEV_MIN_GAP_S`
-  (default 3s, 20 a minute).
-- On a 429 or a "frequency" error the loop backs off exponentially (5s,
-  10s, 20s, up to 120s) and keeps the last judgment meanwhile.
-- A judgment older than `JEV_MAX_JUDGMENT_AGE_S` (default 60s) is not
-  reused: the ladder drops to RULES_ONLY until Jev answers again.
-- One shared client, one call at a time. Never parallel Jev calls, never
-  a second client or a thread pool.
+Logs now include `timing_ms` for market reads, state/reconciliation, decision
+polling, execution and the whole tick (excluding cadence sleep), alongside Jev's
+own request latency, judgment age and status. The terminal shows market and tick
+timing and `waiting for Jev`, `cached`, `stale judgment`, or `state changed`.
+The first tick normally holds while the first background judgment is pending.
 
-## The fallback ladder
+- Calls start at most once every `JEV_MIN_INTERVAL_S` (default 4 seconds),
+  or after `JEV_MIN_GAP_S` (3 seconds) on material changes. Only one request
+  can be in flight. Slower requests lower the call rate further.
+- The price/spread threshold is `JEV_MATERIAL_MOVE_BPS` (15 bps). Inventory
+  changes over 1% also invalidate a judgment, including new fills.
+- Judgment age is measured from request launch, including network time. The
+  default and hard maximum are 10 seconds; `JEV_MAX_JUDGMENT_AGE_S` can lower it.
+  Expired answers and answers from materially changed states are not reused.
+- Rate limits trigger exponential cooldown. A previous answer is usable only
+  while still fresh and relevant. Paper can use the existing deterministic
+  fallback during provider outages. Live always holds without a usable Jev
+  answer and attempts to cancel this run's orders.
+- Risk checks run even while Jev is pending. A hard stop takes precedence over HOLD.
 
-```
-healthy + high confidence -> RUN
-healthy + low confidence  -> REDUCE
-late past the tick budget -> HOLD_LATE (never quote on stale state)
-Jev unavailable            -> RULES_ONLY (deterministic fallback, no model)
-hard limit breached        -> KILL (cancel own orders, market-close the position it built, stop)
-```
+## Live mode (`irl`)
 
-## Live trading (opt-in, off by default)
-
-Paper is the default everywhere: `execution/alpaca.py` will not reach
-Alpaca's live endpoint unless all three of the following are true at
-once.
+Select `irl`, use LIVE Alpaca credentials, explicitly set the environment opt-in,
+and type `I understand this trades real money` at the confirmation prompt.
+The launcher never sets the opt-in on your behalf.
 
 ```bash
+# macOS/Linux
 export JEV_LOOP_ALLOW_LIVE=i-understand-the-risk
-uv run python -m jevloop run --live --ticks 30 --symbol BTC/USD
-# then type the exact confirmation phrase the CLI prints and asks for
+python start_jev.py --mode irl
 ```
 
-Windows PowerShell sets the variable with
-`$env:JEV_LOOP_ALLOW_LIVE = "i-understand-the-risk"` and runs
-`uv run --env-file .env python -m jevloop run --live --ticks 30 --symbol BTC/USD`.
+```powershell
+# Windows PowerShell
+$env:JEV_LOOP_ALLOW_LIVE = "i-understand-the-risk"
+python start_jev.py --mode irl
+```
 
-Missing the environment variable, missing `--live`, or typing anything
-other than the exact confirmation phrase refuses to start; it never
-falls back to paper silently. This is real money with no paper safety
-net, at the same small dollar caps `limits.py` enforces on paper -- a
-strategy can never raise them. Treat `--live` as what it is: a flip of
-a switch made deliberately awkward so it only ever happens on purpose.
+Live boundaries:
+
+- $25 maximum entry order, $50 position cap including pending buys, no short
+  sales, and cash/non-margin buying-power checks with a 1% fee reserve.
+  Live directional buys use IOC limit orders with a price ceiling. Protective
+  market sells may exceed the entry-order cap to close the position.
+- $25 account-equity loss or 5% drawdown latches a stop for the UTC day.
+  The baseline starts at the first live launch that day, persists across
+  restarts, and includes other account activity. It is not a broker statement
+  of trading-only daily P&L. Account checks run about every 10 seconds, subject
+  to network/limiter delays; a stop attempts to flatten this run's position.
+- A 15-minute holding limit triggers an exit and stop even if Jev is unavailable.
+  Market data must have a valid venue timestamp no older than 5 seconds for
+  new entries; this is checked again after the API limiter before submission.
+- Startup requires the selected symbol to be flat, no account orders open,
+  an active account with cash, and a real Jev client. A local account lock
+  prevents concurrent live runs sharing the same `JEV_LOOP_HOME`.
+- Failed market/account checks stop live execution and attempt to cancel
+  this run's orders. Use a dedicated account without other bots/manual orders;
+  the local lock cannot coordinate other computers or different log directories.
+
+Safety state and the account lock are under `~/.jev-loop/live-safety-*` (or
+`JEV_LOOP_HOME`). After a crash, inspect Alpaca orders/positions and stop any other
+process before manually removing a stale `.lock`. Keep the `.json` loss record.
+Ctrl+C or an exhausted tick count cancels own resting orders but may leave a
+position open. Gaps, fees, outages, cancellation races and slippage can exceed
+the configured loss/cap thresholds. These are application checks, not guaranteed
+broker-side stops. No real trade was made during development.
 
 ## Safety
 
