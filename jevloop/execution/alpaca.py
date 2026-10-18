@@ -13,6 +13,7 @@ market is closed, live or paper.
 from __future__ import annotations
 
 import collections
+import math
 import os
 import time
 import uuid
@@ -167,35 +168,41 @@ class AlpacaPaperClient:
             "APCA-API-KEY-ID": api_key,
             "APCA-API-SECRET-KEY": secret_key,
         }
+        self._session = requests.Session()
         self._limiter = RateLimiter(calls_per_minute)
         self._clock_cache: tuple[float, dict] | None = None
         self.order_prefix = f"jevloop-{uuid.uuid4().hex[:8]}-"
         self._order_seq = 0
 
+    def close(self):
+        self._session.close()
+
     # -- low-level HTTP -----------------------------------------------
     def _request(self, method: str, url: str, **kwargs) -> dict:
         self._limiter.wait()
+        if self.is_live and method == "POST" and kwargs.get("json", {}).get("side") == "buy":
+            from ..limits import Limits
+            stamp = getattr(self, "market_data_timestamp", None)
+            if stamp is None or not math.isfinite(stamp) or not 0 <= time.time() - stamp <= Limits().max_stale_data_age_s:
+                raise AlpacaAPIError(0, "live entry refused: market data is stale or missing")
         try:
-            resp = requests.request(
-                method, url, headers=self._headers, timeout=10, **kwargs
+            resp = self._session.request(
+                method, url, headers=self._headers, timeout=10, allow_redirects=False, **kwargs
             )
         except requests.RequestException as exc:
             # A timeout or dropped connection is an API error like any other:
             # the loop counts it toward max_api_errors and carries on, rather
             # than crashing and skipping the clean-up.
-            raise AlpacaAPIError(0, f"network error: {exc}") from exc
+            raise AlpacaAPIError(0, "network error (connection or timeout)") from exc
         if resp.status_code == 401:
-            raise AlpacaAPIError(
-                401,
-                "unauthorized. The key in your .env is either wrong or was copied from the LIVE "
-                "dashboard instead of the PAPER dashboard. Generate a new key at "
-                "https://app.alpaca.markets/paper/dashboard/overview (look for 'Generate New Keys' "
-                "under Your API Keys) and update ALPACA_API_KEY / ALPACA_SECRET_KEY.",
-            )
-        if resp.status_code >= 400:
-            raise AlpacaAPIError(resp.status_code, resp.text)
+            raise AlpacaAPIError(401, "unauthorized; check the key ID and secret for the selected paper/live account")
+        if resp.status_code >= 300:
+            raise AlpacaAPIError(resp.status_code, "broker request rejected; inspect the account/order in Alpaca")
         if resp.text:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError:
+                raise AlpacaAPIError(0, "broker returned invalid JSON") from None
         return {}
 
     # -- account / orders -----------------------------------------------
@@ -235,6 +242,65 @@ class AlpacaPaperClient:
         self._order_seq += 1
         return f"{self.order_prefix}{self._order_seq}"
 
+    def _live_order_guard(self, side, qty, price=None):
+        if not self.is_live:
+            return
+        from ..limits import Limits
+        caps = Limits()
+        if side not in ("buy", "sell") or not math.isfinite(qty) or qty <= 0:
+            raise AlpacaAPIError(0, "invalid live side or quantity")
+        if price is not None and (not math.isfinite(price) or price <= 0):
+            raise AlpacaAPIError(0, "invalid live limit price")
+        if side == "sell":
+            # qty_available excludes shares/coins reserved by other sell orders.
+            symbol = self.symbol.replace("/", "")
+            try:
+                pos = self._request("GET", f"{self.base_url}/v2/positions/{symbol}")
+            except AlpacaAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+                pos = {}
+            try:
+                available = min(float(pos.get("qty", 0)), float(pos.get("qty_available", 0)))
+            except (ValueError, TypeError):
+                available = 0
+            if not math.isfinite(available) or qty > max(0, available):
+                raise AlpacaAPIError(0, "live shorting refused: insufficient unreserved long position")
+            return
+        if price is None:
+            raise AlpacaAPIError(0, "live entries require a limit price")
+        notional = qty * price
+        account = self.get_account()
+        try:
+            cash = float(account.get("cash", 0))
+            buying_power = float(account.get("non_marginable_buying_power", 0))
+        except (ValueError, TypeError):
+            raise AlpacaAPIError(0, "invalid live cash balance") from None
+        if (account.get("status") != "ACTIVE" or account.get("trading_blocked")
+                or account.get("account_blocked") or account.get("trade_suspended_by_user")):
+            raise AlpacaAPIError(0, "live account is inactive or blocked")
+        if not all(math.isfinite(v) for v in (cash, buying_power)) or notional * 1.01 > min(cash, buying_power):
+            raise AlpacaAPIError(0, "live entry exceeds available cash (including 1% fee reserve)")
+        if notional > caps.max_order_notional_usd:
+            raise AlpacaAPIError(0, "live entry exceeds order cap")
+        # Count pending entries as well as broker-confirmed holdings.
+        reserved = 0.0
+        for order in self.get_orders(status="open", limit=500):
+            if order.get("side") != "buy":
+                continue
+            if str(order.get("symbol", "")).replace("/", "") != self.symbol.replace("/", ""):
+                raise AlpacaAPIError(0, "live account has an unrelated pending entry")
+            try:
+                value = max(0, float(order["qty"]) - float(order.get("filled_qty", 0))) * float(order["limit_price"])
+            except (KeyError, TypeError, ValueError):
+                raise AlpacaAPIError(0, "cannot size a pending live entry") from None
+            if not math.isfinite(value) or value < 0:
+                raise AlpacaAPIError(0, "invalid pending live entry")
+            reserved += value
+        held = self.get_position_qty()
+        if not math.isfinite(held) or held < 0 or held * price + reserved + notional > caps.max_position_usd:
+            raise AlpacaAPIError(0, "live entry exceeds position cap")
+
     def submit_limit_order(
         self, side: str, qty: float, limit_price: float, tif: str = "gtc"
     ) -> dict:
@@ -242,6 +308,7 @@ class AlpacaPaperClient:
             raise MarketClosedError(
                 f"{self.symbol} market is closed, refusing to submit an order"
             )
+        self._live_order_guard(side, float(self._qty_str(qty)), float(f"{limit_price:.2f}"))
         body = {
             "symbol": self.symbol,
             "qty": self._qty_str(qty),
@@ -258,6 +325,7 @@ class AlpacaPaperClient:
             raise MarketClosedError(
                 f"{self.symbol} market is closed, refusing to submit an order"
             )
+        self._live_order_guard(side, float(self._qty_str(qty)))
         body = {
             "symbol": self.symbol,
             "qty": self._qty_str(qty),
