@@ -656,7 +656,7 @@
         startedAt = null;
 
       function sideOf(t) {
-        if (t.paused || t.late || t.action === "HOLD_LATE") return "late";
+        if (t.paused || t.late || t.action === "HOLD_LATE" || t.action === "MARKET_CLOSED") return "late";
         if (t.direction_leg === "up") return "buy";
         if (t.direction_leg === "down") return "sell";
         if (t.action === "PULL_QUOTES" || t.action === "STAND_DOWN")
@@ -781,7 +781,7 @@
           : (t.inventory > 0 ? "long " : "short ") + Math.abs(t.inventory);
         const pnlEl = $("pnl");
         const pnl = t.unrealised_pnl_usd || 0;
-        pnlEl.textContent = `p&l ${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)} (${((t.drawdown_pct || 0) * 100).toFixed(2)}% dd)`;
+        pnlEl.textContent = t.unrealised_pnl_usd == null ? "p&l unavailable · market closed" : `p&l ${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)} (${((t.drawdown_pct || 0) * 100).toFixed(2)}% dd)`;
         pnlEl.className = "pnl " + (pnl >= 0 ? "pos" : "neg");
         $("spread").textContent =
           "spread " +
@@ -796,7 +796,7 @@
         a.className = "act " + side;
         $("actms").textContent = t.latency_ms
           ? Math.round(t.latency_ms) + " ms"
-          : "late";
+          : t.action === "MARKET_CLOSED" ? "waiting for open" : t.jev_reused ? "cached" : "—";
         $("actreason").textContent = t.action_reason || "";
 
         $("snap").innerHTML =
@@ -863,7 +863,7 @@
         const fill = t.fill_qty
           ? `${t.fill_qty} @ ${t.fill_price ? t.fill_price.toLocaleString(undefined, { maximumFractionDigits: 1 }) : "—"}`
           : "—";
-        tr.innerHTML = `<td>${t.tick}</td><td class="a">${label}</td><td>${t.quote_environment_conf != null ? "conf " + t.quote_environment_conf.toFixed(2) : ""}</td><td>${t.latency_ms ? Math.round(t.latency_ms) + "ms" : "late"}</td><td>${fill}</td><td>paper</td>`;
+        tr.innerHTML = `<td>${t.tick}</td><td class="a">${label}</td><td>${t.quote_environment_conf != null ? "conf " + t.quote_environment_conf.toFixed(2) : ""}</td><td>${t.latency_ms ? Math.round(t.latency_ms) + "ms" : t.action === "MARKET_CLOSED" ? "closed" : t.jev_reused ? "cached" : "—"}</td><td>${fill}</td><td>${t.mode === "irl" ? "live" : "paper"}</td>`;
         feed.prepend(tr);
         while (feed.children.length > 16) feed.lastChild.remove();
 
