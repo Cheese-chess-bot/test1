@@ -218,7 +218,7 @@ Live boundaries:
 
 - $25 maximum entry order, $50 position cap including pending buys, no short
   sales, and cash/non-margin buying-power checks with a 1% fee reserve.
-  Live directional buys use IOC limit orders with a price ceiling. Protective
+  Live directional buys use price-capped limits: IOC for crypto, DAY for stocks. Protective
   market sells may exceed the entry-order cap to close the position.
 - $25 account-equity loss or 5% drawdown latches a stop for the UTC day.
   The baseline starts at the first live launch that day, persists across
@@ -226,6 +226,7 @@ Live boundaries:
   of trading-only daily P&L. Account checks run about every 10 seconds, subject
   to network/limiter delays; a stop attempts to flatten this run's position.
 - A 15-minute holding limit triggers an exit and stop even if Jev is unavailable.
+  Stock exits can execute only during an open regular session; holdings may remain overnight.
   Market data must have a valid venue timestamp no older than 5 seconds for
   new entries; this is checked again after the API limiter before submission.
 - Startup requires the selected symbol to be flat, no account orders open,
