@@ -59,6 +59,7 @@ from .execution.alpaca import (
 )
 from .ladder import Rung, select_rung
 from .limits import Limits
+from .sessions import closed_wait, describe_clock, next_stock_bar
 from .risk import check as risk_check
 from .policy import (
     KILL,
@@ -304,7 +305,7 @@ def run(
     if bar_seconds:
         print(
             f"tick cadence: one decision at each {bar_seconds / 60:g}-minute bar close "
-            f"(UTC-aligned), Jev deadline {deadline_s:.0f}s"
+            f"({'UTC-aligned' if spec.is_24_7 else 'aligned to 09:30 New York session open'}), Jev deadline {deadline_s:.0f}s"
         )
     else:
         print(
@@ -401,6 +402,8 @@ def run(
     recent_ticks: list[dict] = []
     block = 0
     started_at = time.time()
+    was_market_closed = False
+    stock_bar_due = None
 
     n = 0
     previous_sigterm_handler = None
@@ -411,7 +414,7 @@ def run(
 
     try:
         while ticks is None or n < ticks:
-            if bar_seconds:
+            if bar_seconds and spec.is_24_7:
                 time.sleep(_seconds_to_bar_close(time.time(), bar_seconds))
             tick_start = time.monotonic()
             block += 1
@@ -423,17 +426,44 @@ def run(
             if not spec.is_24_7:
                 try:
                     market_open = alpaca.is_market_open()
+                    clock = dict(alpaca.get_clock(), is_open=market_open)
+                    session_description = describe_clock(clock)
                 except AlpacaAPIError as exc:
                     api_error_streak += 1
                     print(f"tick {block} | alpaca error checking market hours: {exc}")
                     if live or api_error_streak > limits.max_api_errors:
                         print("Broker error limit reached; stopping and cancelling own orders.")
                         break
-                    _sleep_remaining(tick_start, cadence_s)
+                    _sleep_remaining(tick_start, max(cadence_s, 5.0))
                     n += 1
                     continue
                 if not market_open:
+                    if not was_market_closed:
+                        stock_bar_due = None
+                        if not dry_execution and alpaca._order_seq > 0:
+                            try:
+                                alpaca.cancel_own_orders()
+                            except AlpacaAPIError as exc:
+                                print(f"Could not cancel closing-session orders: {exc}; stopping for inspection.")
+                                break
+                        resting_quotes = None
+                        rest_counter = 0
+                    was_market_closed = True
+                    # Reconcile closing-auction fills/cancels without submitting new orders.
+                    if not dry_execution and alpaca._order_seq > 0:
+                        try:
+                            _, reconcile_needed = reconcile_fills(alpaca, inv, fills_seen, expected_px,
+                                                                  session_start_iso, now, open_buys)
+                        except AlpacaAPIError as exc:
+                            print(f"Could not reconcile closed-session orders: {exc}; stopping for inspection.")
+                            break
+                    api_error_streak = 0
                     record = _closed_market_record(block, now, spec.symbol)
+                    record.update(action_reason=f"Regular session closed; {session_description}. Waiting automatically.",
+                                  next_open=clock["next_open"], next_close=clock["next_close"],
+                                  market_session="closed", inventory=inv.inventory,
+                                  unrealised_pnl_usd=None, drawdown_pct=None,
+                                  paused=control.is_paused(LOG_DIR), mode="irl" if live else "paper")
                     _append_log(record)
                     recent_ticks.append(record)
                     if len(recent_ticks) > LATEST_WINDOW:
@@ -447,11 +477,33 @@ def run(
                         api_error_streak,
                     )
                     print(
-                        f"tick {block} | {spec.symbol} market is closed, prices are stale | HOLD"
+                        f"tick {block} | {spec.symbol} regular session closed; {session_description} | WAIT"
                     )
                     n += 1
-                    _sleep_remaining(tick_start, cadence_s)
+                    if ticks is None or n < ticks:
+                        _sleep_remaining(tick_start, closed_wait(clock, time.time()))
                     continue
+
+                if was_market_closed:
+                    print(f"{spec.symbol} regular session OPEN; {session_description}. Refreshing market history.")
+                    price_hist = []
+                    try:
+                        price_hist = _minute_bar_history(alpaca, now)
+                    except (AlpacaAPIError, KeyError, ValueError) as exc:
+                        print(f"Session history unavailable ({exc}); warming up with fresh data.")
+                    trade_tape.clear()
+                    seen_trade_ids.clear()
+                    trades_since_iso = _iso(now - TRADE_TAPE_S)
+                    inv.vwap_cum_pv = inv.vwap_cum_vol = inv.vwap_last_trade_ts = 0.0
+                    was_market_closed = False
+                if bar_seconds:
+                    if stock_bar_due is None:
+                        stock_bar_due = next_stock_bar(clock, now, bar_seconds, BAR_SETTLE_S)
+                    if now < stock_bar_due:
+                        block -= 1
+                        _sleep_remaining(tick_start, min(30.0, stock_bar_due - now))
+                        continue
+                    stock_bar_due = None
 
             # 2. read the book
             try:
@@ -730,6 +782,8 @@ def run(
                 "decision_status": decision_status,
                 "decision_pending": meta.get("pending", False),
                 "mode": "irl" if live else "paper",
+                "market_session": "24/7" if spec.is_24_7 else "regular",
+                "next_close": None if spec.is_24_7 else clock["next_close"],
                 "timing_ms": {"market": round(market_ms, 1), "state": round(state_ms, 1),
                               "decision_poll": round(decision_poll_ms, 1),
                               "execution": round(execution_ms, 1),
@@ -1021,7 +1075,7 @@ def _execute_action(
                         held_usd = max(alpaca.get_position_qty(), inv.inventory, 0.0) * mid
                         buy_room_usd = limits.max_position_usd - held_usd
                     sides = [("sell", sell_qty, ask_px)]
-                    if getattr(alpaca, "is_live", False):
+                    if getattr(alpaca, "is_live", False) or not spec.is_24_7:
                         sell_qty = _floor_qty(min(sell_qty, max(inv.inventory, 0.0), max(alpaca.get_position_qty(), 0.0)), spec)
                         sides = [("sell", sell_qty, ask_px)] if sell_qty > 0 else []
                     if buy_qty * bid_px <= buy_room_usd:
@@ -1101,14 +1155,15 @@ def _execute_action(
                     inv.orders_submitted += 1
                     if getattr(alpaca, "is_live", False) and side == "buy":
                         # Live entries have a price ceiling; never an unbounded market buy.
-                        o = alpaca.submit_limit_order(side, leg_qty, fill_px, tif="ioc")
+                        o = alpaca.submit_limit_order(side, leg_qty, fill_px, tif="ioc" if spec.is_24_7 else "day")
                     else:
                         o = alpaca.submit_market_order(side, leg_qty)
                     if expected_px is not None and o.get("client_order_id"):
                         expected_px[o["client_order_id"]] = mid
                     # Not recorded as filled here: inventory and PnL only move
                     # when Alpaca reports the fill (reconcile_fills, next tick).
-                    fill_txt = f"sent {'IOC limit' if getattr(alpaca, 'is_live', False) and side == 'buy' else 'market'} {side} {leg_qty}"
+                    order_label = ('IOC limit' if spec.is_24_7 else 'DAY limit') if getattr(alpaca, 'is_live', False) and side == 'buy' else 'market'
+                    fill_txt = f"sent {order_label} {side} {leg_qty}"
                     line_action = f"{action.kind} skew {action.skew:+.1f} + {side} leg"
                 except MarketClosedError as exc:
                     fill_txt = f"leg skipped: {exc}"
@@ -1156,7 +1211,7 @@ def _append_log(record: dict) -> None:
 
 def _write_latest(symbol, block, ticks, meta, started_at, api_error_streak) -> None:
     calls = len(ticks)
-    late = sum(1 for t in ticks if t["action"] in ("HOLD_LATE", "MARKET_CLOSED"))
+    late = sum(1 for t in ticks if t["action"] == "HOLD_LATE")
     latencies = [t["latency_ms"] for t in ticks if t.get("latency_ms")]
     avg_ms = sum(latencies) / len(latencies) if latencies else None
     payload = {
