@@ -97,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["test", "full", "irl"], help="Prompted when omitted")
     parser.add_argument("--symbol", help="Alpaca symbol, e.g. BTC/USD or AAPL")
+    parser.add_argument("--market", choices=["auto", "stocks", "crypto"], default="auto",
+                        help="auto detects the market from the symbol; stocks/crypto validates your selection")
     parser.add_argument("--ticks", type=nonnegative_int, default=None,
                         help="Optional tick bound for full/irl; test is always 30 ticks, 0 is continuous")
     parser.add_argument("--bar", choices=["1m", "5m", "15m", "30m", "1h"])
@@ -135,8 +137,14 @@ def main(argv: list[str] | None = None) -> int:
             print("Fresh market data and Jev judgments required. Use a dedicated account; no other bots or manual orders.")
         print("Keys are hidden and kept in this process only; no credentials are saved.")
         print("Verification sends one billed Jev request; a running loop makes further billed calls.")
-        symbol = args.symbol or input("Symbol [BTC/USD]: ").strip() or "BTC/USD"
-        symbol = resolve_symbol(symbol).symbol
+        default_symbol = "AAPL" if args.market == "stocks" else "BTC/USD"
+        symbol = args.symbol or input(f"Symbol [{default_symbol}]: ").strip() or default_symbol
+        spec = resolve_symbol(symbol)
+        symbol = spec.symbol
+        if args.market != "auto" and (args.market == "crypto") != spec.is_24_7:
+            raise ValueError("Symbol does not match --market; use a stock ticker or a crypto pair as appropriate")
+        print("Schedule: crypto 24/7" if spec.is_24_7 else
+              "Schedule: automatic US regular session; exchange clock handles holidays and daylight saving. Closed sessions wait and resume automatically.")
         credentials = collect_credentials(args.use_env, live)
         verify_connections(credentials, args.model, live)
         if args.check_only:

@@ -99,8 +99,51 @@ paper: a mock run is always a dry run.
 
 ## Running continuously
 
+### Automatic US-stock sessions
+
+Update dependencies after pulling this version (includes Windows timezone data):
+
+```bash
+python -m pip install -e ".[dev]"
+python start_jev.py --mode full --market stocks --symbol AAPL
+```
+
+`AAPL` is an example, not a recommendation. Use an Alpaca-tradable, fractionable
+US stock/ETF. `--market auto` is the default and detects stocks versus crypto
+from the symbol; `--market stocks` and `--market crypto` reject mismatches.
+With `--market stocks` and no symbol, the launcher prompts with `AAPL` as its default.
+
+- Stocks use Alpaca's regular-session clock, including weekends, holidays,
+  early closes and US daylight saving. There is no fixed India-time schedule.
+- Closed sessions display `MARKET_CLOSED` and the next opening in New York and
+  India time. The loop rechecks at most 30 seconds apart, waking sooner near
+  the scheduled open. No trading decisions are requested while closed (the
+  launcher's one initial billed connection check still runs).
+- At reopening, history and trade-flow buffers refresh and normal processing
+  resumes. A dashboard PAUSED state stays paused: press Start to allow orders.
+- Stock `--bar` intervals are anchored to 09:30 New York time. A final partial
+  bar at an early close does not cause after-hours trading. Bar mode is paper only.
+- Fractional stock limit orders default to DAY; crypto defaults to GTC. Live
+  stock entries use price-capped DAY limits, which may rest until filled,
+  canceled or expired. The stock data adapter consistently requests IEX data.
+- On observing closure the bot attempts to cancel its own orders and reconciles
+  their final fills. It does **not** automatically liquidate positions at close;
+  market exits wait until the venue reopens. Cancellation failure stops the run
+  for inspection. Existing holdings from other runs remain outside its tracking.
+- `full` waits across sessions until stopped. `test` still stops after 30 loop
+  iterations, including closed-market checks; 30 such checks may take about 15 minutes.
+- Crypto retains its 24/7 schedule. Switching symbols requires restarting with
+  the new symbol and does not sell or manage positions in the previous symbol.
+
+The dashboard remains a separate command: `python -m jevloop serve`.
+This update does not enable extended-hours trading or add indicator strategies.
+
+References: [Alpaca clock](https://docs.alpaca.markets/us/reference/legacyclock),
+[fractional trading](https://docs.alpaca.markets/us/docs/fractional-trading).
+
 Use `python start_jev.py --mode full` in a terminal. Keep that process running.
-Add `--bar 30m` (or `1m`, `5m`, `15m`, `1h`) for decisions on UTC bar closes.
+Add `--bar 30m` (or `1m`, `5m`, `15m`, `1h`) for decisions on bar closes.
+Crypto bars are UTC-aligned; stock bars start at 09:30 America/New_York.
 Ctrl+C stops the foreground loop and attempts to cancel its own resting orders.
 It does not automatically flatten positions. A forced process kill can skip
 cleanup. The dashboard reads `~/.jev-loop/latest.json`.
