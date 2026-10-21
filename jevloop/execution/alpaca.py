@@ -180,6 +180,11 @@ class AlpacaPaperClient:
     # -- low-level HTTP -----------------------------------------------
     def _request(self, method: str, url: str, **kwargs) -> dict:
         self._limiter.wait()
+        if method == "POST" and url.endswith("/v2/orders") and not self.spec.is_24_7:
+            from ..sessions import timestamp
+            # Rate limiting can carry an approved order across the close.
+            if not self._clock_cache or not self._clock_cache[1]["is_open"] or time.time() >= timestamp(self._clock_cache[1]["next_close"]):
+                raise MarketClosedError("Regular stock session ended before order submission")
         if self.is_live and method == "POST" and kwargs.get("json", {}).get("side") == "buy":
             from ..limits import Limits
             stamp = getattr(self, "market_data_timestamp", None)
@@ -224,13 +229,23 @@ class AlpacaPaperClient:
         if self._clock_cache and now - self._clock_cache[0] < cache_s:
             return self._clock_cache[1]
         data = self._request("GET", f"{self.base_url}/v2/clock")
+        from ..sessions import timestamp
+        try:
+            if type(data.get("is_open")) is not bool:
+                raise ValueError("missing market state")
+            timestamp(data["next_open"])
+            timestamp(data["next_close"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise AlpacaAPIError(0, "invalid exchange clock; refusing to trade") from None
         self._clock_cache = (now, data)
         return data
 
     def is_market_open(self) -> bool:
         if self.spec.is_24_7:
             return True
-        return bool(self.get_clock().get("is_open"))
+        from ..sessions import timestamp
+        clock = self.get_clock()
+        return clock["is_open"] and time.time() < timestamp(clock["next_close"])
 
     def _qty_str(self, qty: float) -> str:
         return f"{qty:.{self.spec.qty_precision}f}"
@@ -302,8 +317,10 @@ class AlpacaPaperClient:
             raise AlpacaAPIError(0, "live entry exceeds position cap")
 
     def submit_limit_order(
-        self, side: str, qty: float, limit_price: float, tif: str = "gtc"
+        self, side: str, qty: float, limit_price: float, tif: str | None = None
     ) -> dict:
+        if not self.spec.is_24_7 and not float(self._qty_str(qty)).is_integer() and tif not in (None, "day"):
+            raise AlpacaConfigError("Fractional stock limit orders require DAY time in force")
         if not self.spec.is_24_7 and not self.is_market_open():
             raise MarketClosedError(
                 f"{self.symbol} market is closed, refusing to submit an order"
@@ -314,7 +331,7 @@ class AlpacaPaperClient:
             "qty": self._qty_str(qty),
             "side": side,
             "type": "limit",
-            "time_in_force": tif,
+            "time_in_force": tif or ("gtc" if self.spec.is_24_7 else "day"),
             "limit_price": f"{limit_price:.2f}",
             "client_order_id": self.new_client_order_id(),
         }
@@ -404,13 +421,13 @@ class AlpacaPaperClient:
     def get_latest_quote(self) -> dict:
         """Best bid/ask. The only depth source at all on equities."""
         data = self._request(
-            "GET", self.spec.latest_quote_url, params={"symbols": self.symbol}
+            "GET", self.spec.latest_quote_url, params=self._data_params()
         )
         return data.get("quotes", {}).get(self.symbol, {})
 
     def get_latest_trade(self) -> dict:
         data = self._request(
-            "GET", self.spec.latest_trade_url, params={"symbols": self.symbol}
+            "GET", self.spec.latest_trade_url, params=self._data_params()
         )
         return data.get("trades", {}).get(self.symbol, {})
 
